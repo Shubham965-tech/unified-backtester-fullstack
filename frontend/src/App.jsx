@@ -11,7 +11,7 @@ import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line,
   LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from "recharts";
-import { getExamples, getHealth, getMeta, getExperiments, runBacktest, generateAlphaIdeas } from "./api";
+import { getExamples, getHealth, getMeta, getExperiments, getExecutionJobs, getExecutionJob, cancelExecutionJob, submitExecutionJob, runBacktest, runHandoffBacktest, generateAlphaIdeas } from "./api";
 import { demoExamples, demoAlphas, makeDemoResult } from "./mockData";
 
 const NAV = [
@@ -104,6 +104,7 @@ export default function App() {
   const [selectedRuns, setSelectedRuns] = useState(["AL-1042","AL-1039"]);
   const [validationOpen, setValidationOpen] = useState({ leakage: true, coverage: true });
   const [history, setHistory] = useState([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
   const notify = useCallback((msg) => { setToast(msg); window.setTimeout(() => setToast(""), 3000); }, []);
   const refreshHealth = useCallback(async () => {
@@ -113,12 +114,63 @@ export default function App() {
       setHealth("connected"); setDataMode(h.data_mode || "unknown");
       const m = await getMeta(); setMeta(m);
       try { const ex = await getExamples(); if (Array.isArray(ex) && ex.length) setExamples(ex); } catch {}
-      try { const runs = await getExperiments(); if (Array.isArray(runs)) setHistory(runs); } catch {}
+      try {
+        const response = await getExecutionJobs(30);
+        if (Array.isArray(response?.jobs)) {
+          setHistory(response.jobs.map(job => ({
+            experiment_id: job.job_id,
+            run_id: job.job_id,
+            expression: job.config?.expression || job.result?.expression || job.result?.config?.expression || "",
+            status: job.status,
+            created_at: job.created_at,
+            error: job.error,
+            result: job.result,
+            config: job.config
+          })));
+          setHistoryLoaded(true);
+        }
+      } catch {
+        try {
+          const runs = await getExperiments();
+          if (Array.isArray(runs)) { setHistory(runs); setHistoryLoaded(true); }
+        } catch {}
+      }
     } catch {
       setHealth("offline"); setMeta(null);
     }
   }, []);
   useEffect(() => { refreshHealth(); }, [refreshHealth]);
+
+  // Keep the history table in sync while the user is monitoring background jobs.
+  useEffect(() => {
+    if (page !== "runs" || health !== "connected") return undefined;
+    let active = true;
+    const refreshExecutionHistory = async () => {
+      try {
+        const response = await getExecutionJobs(30);
+        if (!active || !Array.isArray(response?.jobs)) return;
+        setHistory(response.jobs.map(job => ({
+          experiment_id: job.job_id,
+          run_id: job.job_id,
+          expression: job.config?.expression || job.result?.expression || job.result?.config?.expression || "",
+          status: job.status,
+          created_at: job.created_at,
+          error: job.error,
+          result: job.result,
+          config: job.config
+        })));
+        setHistoryLoaded(true);
+      } catch {
+        // Preserve the last known history if a transient refresh fails.
+      }
+    };
+    refreshExecutionHistory();
+    const intervalId = window.setInterval(refreshExecutionHistory, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [page, health]);
 
   const series = useMemo(() => (result?.series?.dates || []).map((date, i) => ({
     date, gross: result.series.cum_gross?.[i], cumNet: result.series.cum_net?.[i],
@@ -131,6 +183,78 @@ export default function App() {
     const matches = `${a.name} ${a.expression} ${a.id} ${(a.tags || []).join(" ")}`.toLowerCase().includes(search.toLowerCase());
     return matches && (statusFilter === "All statuses" || a.status === statusFilter);
   }).sort((a,b) => sortKey === "sharpe" ? (b.sharpe || -Infinity) - (a.sharpe || -Infinity) : String(b[sortKey] || "").localeCompare(String(a[sortKey] || ""))), [alphas, search, statusFilter, sortKey]);
+
+  const inspectRun = async (run) => {
+    const jobId = run.run_id || run.experiment_id;
+    if (!jobId) {
+      notify("This history entry has no execution job ID.");
+      return;
+    }
+    try {
+      const job = await getExecutionJob(jobId);
+      if (job.status === "succeeded" && job.result) {
+        setResult(job.result);
+        setIsDemoResult(false);
+        if (job.config?.expression) setExpression(job.config.expression);
+        setPage("results");
+        setActiveTab("Overview");
+        notify("Loaded the saved result for this execution job.");
+        return;
+      }
+      if (job.status === "failed") {
+        notify(job.error?.message || "This execution job failed and has no result to inspect.");
+        return;
+      }
+      notify(job.status === "cancelled"
+        ? "This execution job was cancelled."
+        : job.status === "queued" || job.status === "running"
+          ? `This execution job is still ${job.status}.`
+          : "A saved result is not available for this history entry.");
+    } catch (error) {
+      notify(error.message || "Could not load this execution job.");
+    }
+  };
+
+  const cancelRun = async (run) => {
+    const jobId = run.run_id || run.experiment_id;
+    if (!jobId || run.status !== "queued") return;
+    try {
+      const cancelled = await cancelExecutionJob(jobId);
+      setHistory(current => current.map(item =>
+        (item.run_id || item.experiment_id) === jobId
+          ? { ...item, status: cancelled.status }
+          : item
+      ));
+      notify("Queued backtest cancelled.");
+    } catch (error) {
+      notify(error.message || "Could not cancel this execution job.");
+      await refreshHealth();
+    }
+  };
+
+  const retryRun = async (run) => {
+    if (run.status !== "failed" || !run.config || typeof run.config !== "object") return;
+    try {
+      const job = await submitExecutionJob(run.config);
+      const historyItem = {
+        experiment_id: job.job_id,
+        run_id: job.job_id,
+        expression: job.config?.expression || "",
+        status: job.status,
+        created_at: job.created_at,
+        error: job.error,
+        config: job.config,
+        result_available: false
+      };
+      setHistory(current => [historyItem, ...current.filter(item =>
+        (item.run_id || item.experiment_id) !== job.job_id
+      )]);
+      setHistoryLoaded(true);
+      notify("Retry queued with the saved configuration.");
+    } catch (error) {
+      notify(error.message || "Could not retry this backtest.");
+    }
+  };
 
   const applyAlpha = (alpha) => {
     setSelectedAlpha(alpha); setExpression(alpha.expression); setAlphaName(alpha.name); setUniverse(alpha.universe || "NIFTY50");
@@ -172,7 +296,16 @@ export default function App() {
     if (strategyPrompt.trim().length < 20) { notify("Describe your strategy in a little more detail (at least 20 characters)."); return; }
     setGeneratingIdeas(true); setGeneratedIdeas([]); setGenerationNote(""); setIdeaBacktests({});
     try {
-      const response = await generateAlphaIdeas({ idea: strategyPrompt, universe, start, end });
+      const response = await generateAlphaIdeas({
+        idea: strategyPrompt, cluster: "D1", universe, start, end,
+        strategy_context: {
+          holding_period_bars: Number(holding),
+          execution_lag_bars: Number(lag),
+          execution_price: executionPrice,
+          portfolio,
+          weighting,
+        },
+      });
       setGeneratedIdeas(response.ideas || []); setGenerationNote(response.note || "Review each hypothesis and its limitations before running it.");
       notify(`Gemini generated ${(response.ideas || []).length} validated candidate ideas.`);
     } catch (err) { setGenerationNote(err.message); notify(`Idea generation failed: ${err.message}`); }
@@ -183,9 +316,26 @@ export default function App() {
     setPage("create"); notify("Expression loaded. Review it and the backtest settings before running.");
   };
   const backtestGeneratedIdea = async (idea) => {
+    const handoff = idea?.handoff;
+    if (!handoff || handoff.assistant_status !== "ready_for_notebook2") {
+      setIdeaBacktests(old => ({
+        ...old,
+        [idea.id]: { status: "error", error: "This candidate needs clarification before it can be backtested." }
+      }));
+      return;
+    }
     setIdeaBacktests(old => ({ ...old, [idea.id]: { status: "running" } }));
     try {
-      const out = await runBacktest({ ...buildPayload(), expression: idea.expression });
+      const overrides = {
+        transaction_cost_bps: Number(cost),
+        slippage_bps: Number(slippage),
+        n_buckets: Number(buckets),
+        k: Number(k),
+        long_exposure: Number(longExposure),
+        short_exposure: Number(shortExposure),
+        ...(positionCap !== "" ? { max_position_weight: Number(positionCap) } : {}),
+      };
+      const out = await runHandoffBacktest(handoff, { start, end, overrides });
       setIdeaBacktests(old => ({ ...old, [idea.id]: { status: "success", result: out } }));
       setHistory(old => [{ experiment_id: out.experiment_id, status: "success", expression: idea.expression, created_at: new Date().toISOString() }, ...old].slice(0, 30));
     } catch (err) { setIdeaBacktests(old => ({ ...old, [idea.id]: { status: "error", error: err.message } })); }
@@ -236,7 +386,7 @@ export default function App() {
       </header>
 
       {page === "workspace" && <section className="page-content">
-        <div className="page-title-row"><div><div className="eyebrow"><span className="eyebrow-line"/> ALPHA RESEARCH</div><h1>Alpha workspace</h1><p className="page-subtitle">Build signals, run experiments, inspect evidence.</p></div><div className="title-actions"><button className="btn btn-secondary" onClick={() => nav("runs")}><History size={15}/> Run history</button><button className="btn btn-primary" onClick={() => {setAlphaName("Untitled alpha");setExpression("");setSelectedAlpha(null);nav("create");}}><Plus size={16}/> Create alpha</button></div></div>
+        <div className="page-title-row"><div><h1>Alpha workspace</h1><p className="page-subtitle">Build signals, run experiments, inspect evidence.</p></div><div className="title-actions"><button className="btn btn-secondary" onClick={() => nav("runs")}><History size={15}/> Run history</button><button className="btn btn-primary" onClick={() => {setAlphaName("Untitled alpha");setExpression("");setSelectedAlpha(null);nav("create");}}><Plus size={16}/> Create alpha</button></div></div>
         <div className="stat-strip">
           <Metric label="Saved alphas" value={String(alphas.length).padStart(2,"0")} sub="Across this workspace" icon={Layers3}/>
           <Metric label="Completed runs" value="24" sub="Last 30 days" icon={CheckCircle2}/>
@@ -263,7 +413,7 @@ export default function App() {
       </section>}
 
       {page === "create" && <section className="page-content">
-        <div className="page-title-row compact-title"><div><div className="eyebrow"><span className="eyebrow-line"/> RESEARCH EDITOR</div><h1>{alphaName || "Untitled alpha"}</h1><p className="page-subtitle">Edit your signal and configure an immutable experiment snapshot.</p></div><div className="title-actions"><span className="autosave"><span/> Draft changes</span><button className="btn btn-secondary" onClick={saveAlpha}><Check size={15}/> Save alpha</button><button className="btn btn-primary" onClick={simulate} disabled={running}>{running?<RefreshCw className="spin" size={15}/>:<Play size={15} fill="currentColor"/>}{running?"Running…":"Run backtest"}</button></div></div>
+        <div className="page-title-row compact-title"><div><h1>{alphaName || "Untitled alpha"}</h1><p className="page-subtitle">Edit your signal and configure an immutable experiment snapshot.</p></div><div className="title-actions"><span className="autosave"><span/> Draft changes</span><button className="btn btn-secondary" onClick={saveAlpha}><Check size={15}/> Save alpha</button><button className="btn btn-primary" onClick={simulate} disabled={running}>{running?<RefreshCw className="spin" size={15}/>:<Play size={15} fill="currentColor"/>}{running?"Running…":"Run backtest"}</button></div></div>
         <Panel title="Describe your strategy" subtitle="No expression-writing skills required. Explain the market behavior you want to capture" className="idea-assistant-panel">
           <div className="idea-prompt-row">
             <div className="idea-prompt-input"><label htmlFor="strategy-prompt">Your strategy
@@ -272,7 +422,7 @@ export default function App() {
           </div>
           {generationNote && <div className={`generation-note ${generatedIdeas.length ? "success-note" : "error-note"}`}>{generationNote}</div>}
           {generatedIdeas.length > 0 && <div className="generated-ideas"><div className="generated-ideas-head"><div><strong>Candidate alpha ideas</strong><span>{generatedIdeas.length} candidates · syntax/registry checked, not yet proven profitable</span></div><span className="validation-chip"><ShieldCheck size={13}/> Engine fields checked</span></div>
-            {generatedIdeas.map((idea, idx) => { const bt=ideaBacktests[idea.id]; return <article className="generated-idea-card" key={idea.id || idx}><div className="generated-idea-top"><span className="idea-index">0{idx+1}</span><div className="generated-idea-copy"><h4>{idea.name}</h4><p>{idea.hypothesis}</p></div><Status status={bt?.status === "success" ? "Backtested" : bt?.status === "running" ? "Running" : bt?.status === "error" ? "Failed" : "Candidate"}/></div><code className="generated-expression">{idea.expression}</code><div className="generated-idea-details"><div><strong>Why it might work</strong><p>{idea.rationale}</p></div><div><strong>Expected behavior</strong><p>{idea.expected_behavior}</p></div><div><strong>Risks & caveats</strong><p>{Array.isArray(idea.risks) ? idea.risks.join(" ") : idea.risks}</p></div></div>{bt?.status === "success" && <div className="candidate-result-strip"><span>Net Sharpe <b>{fmtNum(bt.result?.summary?.sharpe_net)}</b></span><span>Annual net return <b>{fmtPct(bt.result?.summary?.annual_return_net)}</b></span><span>Max drawdown <b>{fmtPct(bt.result?.summary?.max_drawdown)}</b></span></div>}{bt?.status === "error" && <p className="candidate-error">Backtest failed: {bt.error}</p>}<div className="generated-idea-actions"><button className="btn btn-secondary" onClick={()=>selectGeneratedIdea(idea)}>Open in expression editor</button><button className="btn btn-primary" disabled={bt?.status === "running"} onClick={()=>backtestGeneratedIdea(idea)}>{bt?.status === "running"?<RefreshCw className="spin" size={14}/>:<Play size={14}/>}{bt?.status === "running"?"Backtesting…":bt?.status === "success"?"Run again":"Backtest this idea"}</button></div></article>})}
+            {generatedIdeas.map((idea, idx) => { const bt=ideaBacktests[idea.id]; return <article className="generated-idea-card" key={idea.id || idx}><div className="generated-idea-top"><span className="idea-index">0{idx+1}</span><div className="generated-idea-copy"><h4>{idea.name}</h4><p>{idea.hypothesis}</p></div><Status status={bt?.status === "success" ? "Backtested" : bt?.status === "running" ? "Running" : bt?.status === "error" ? "Failed" : idea.handoff?.assistant_status === "ready_for_notebook2" ? "Ready" : "Needs clarification"}/></div><code className="generated-expression">{idea.expression}</code><div className="generated-idea-details"><div><strong>Why it might work</strong><p>{idea.rationale}</p></div><div><strong>Expected behavior</strong><p>{idea.expected_behavior}</p></div><div><strong>Risks & caveats</strong><p>{Array.isArray(idea.risks) ? idea.risks.join(" ") : idea.risks}</p></div><div><strong>Entry rules</strong><p>{(idea.handoff?.entry_rules || []).join(" ") || "Not specified"}</p></div><div><strong>Exit rules</strong><p>{(idea.handoff?.exit_rules || []).join(" ") || "Not specified"}</p></div><div><strong>Execution rules</strong><p>{(idea.handoff?.execution_rules || []).join(" ") || "Not specified"}</p></div></div>{idea.handoff?.assistant_status !== "ready_for_notebook2" && <p className="candidate-error">Clarification needed: {(idea.handoff?.clarifying_questions || []).join(" ") || "Complete entry, exit, and execution rules before backtesting."}</p>}{bt?.status === "success" && <div className="candidate-result-strip"><span>Net Sharpe <b>{fmtNum(bt.result?.summary?.sharpe_net)}</b></span><span>Annual net return <b>{fmtPct(bt.result?.summary?.annual_return_net)}</b></span><span>Max drawdown <b>{fmtPct(bt.result?.summary?.max_drawdown)}</b></span></div>}{bt?.status === "error" && <p className="candidate-error">Backtest failed: {bt.error}</p>}<div className="generated-idea-actions"><button className="btn btn-secondary" onClick={()=>selectGeneratedIdea(idea)}>Open in expression editor</button><button className="btn btn-primary" disabled={bt?.status === "running" || idea.handoff?.assistant_status !== "ready_for_notebook2"} onClick={()=>backtestGeneratedIdea(idea)}>{bt?.status === "running"?<RefreshCw className="spin" size={14}/>:<Play size={14}/>}{bt?.status === "running"?"Backtesting…":bt?.status === "success"?"Run again":idea.handoff?.assistant_status !== "ready_for_notebook2"?"Needs clarification":"Backtest this idea"}</button></div></article>})}
           </div>}
         </Panel>
         <div className="editor-layout">
@@ -305,7 +455,7 @@ export default function App() {
       </section>}
 
       {page === "results" && <section className="page-content">
-        <div className="page-title-row compact-title"><div><div className="eyebrow"><span className="eyebrow-line"/> EXPERIMENT RESULT</div><div className="result-title"><h1>{alphaName}</h1><Status status="Succeeded"/></div><p className="page-subtitle"><span className="mono">{result?.experiment_id || "run-preview"}</span> · {result?.config?.universe || universe} · {result?.config?.start || start} — {result?.config?.end || end}</p></div><div className="title-actions"><button className="btn btn-secondary" onClick={exportJSON}><FileJson size={15}/> Export JSON</button><button className="btn btn-secondary" onClick={exportCSV}><Download size={15}/> CSV</button><button className="btn btn-primary" onClick={()=>{setPage("create");}}><Play size={14}/> Rerun</button></div></div>
+        <div className="page-title-row compact-title"><div><div className="result-title"><h1>{alphaName}</h1><Status status="Succeeded"/></div><p className="page-subtitle"><span className="mono">{result?.experiment_id || "run-preview"}</span> · {result?.config?.universe || universe} · {result?.config?.start || start} — {result?.config?.end || end}</p></div><div className="title-actions"><button className="btn btn-secondary" onClick={exportJSON}><FileJson size={15}/> Export JSON</button><button className="btn btn-secondary" onClick={exportCSV}><Download size={15}/> CSV</button><button className="btn btn-primary" onClick={()=>{setPage("create");}}><Play size={14}/> Rerun</button></div></div>
         {demo && <div className="notice warning-notice"><AlertTriangle size={16}/><div><strong>Illustrative preview data</strong><p>This chart set is dummy/synthetic data, not evidence about real market performance. Connect the API and run the expression to view engine output.</p></div><button className="btn btn-quiet" onClick={refreshHealth}>Retry API <RefreshCw size={13}/></button></div>}
         <div className="expression-snapshot"><div><span>EXPRESSION SNAPSHOT</span><code>{result?.config?.expression || expression}</code></div><button className="btn btn-quiet" onClick={copyCurl}><Copy size={14}/> Copy cURL</button></div>
         <div className="result-tabs">{chartTabs.map(t=><button key={t} className={activeTab===t?"selected":""} onClick={()=>setActiveTab(t)}>{t}</button>)}</div>
@@ -343,12 +493,12 @@ export default function App() {
       </section>}
 
       {(page === "saved" || page === "runs") && <section className="page-content">
-        <div className="page-title-row"><div><div className="eyebrow"><span className="eyebrow-line"/> RESEARCH LIBRARY</div><h1>{page==="saved"?"Saved alphas":"Runs & history"}</h1><p className="page-subtitle">{page==="saved"?"Manage reusable expressions and draft versions.":"Inspect run status, immutable snapshots and experiment outputs."}</p></div><div className="title-actions"><button className="btn btn-primary" onClick={()=>{setAlphaName("Untitled alpha");setExpression("");setSelectedAlpha(null);nav("create");}}><Plus size={15}/> New alpha</button></div></div>
-        <Panel title={page==="saved"?"Alpha library":"Experiment history"} subtitle={page==="saved"?"Saved expressions in this workspace":"Recent runs in this browser preview"} action={<button className="btn btn-secondary" onClick={()=>page==="saved"?saveAlpha():refreshHealth()}><RefreshCw size={14}/> Refresh</button>}>
+        <div className="page-title-row"><div><h1>{page==="saved"?"Saved alphas":"Runs & history"}</h1><p className="page-subtitle">{page==="saved"?"Manage reusable expressions and draft versions.":"Inspect run status, immutable snapshots and experiment outputs."}</p></div><div className="title-actions"><button className="btn btn-primary" onClick={()=>{setAlphaName("Untitled alpha");setExpression("");setSelectedAlpha(null);nav("create");}}><Plus size={15}/> New alpha</button></div></div>
+        <Panel title={page==="saved"?"Alpha library":"Execution job history"} subtitle={page==="saved"?"Saved expressions in this workspace":historyLoaded?"Latest persisted backtest jobs from the backend":"Backend history unavailable; showing preview rows"} action={<button className="btn btn-secondary" onClick={()=>page==="saved"?saveAlpha():refreshHealth()}><RefreshCw size={14}/> Refresh</button>}>
           <div className="table-toolbar"><div className="search-box"><Search size={15}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by name, expression or run ID…"/></div><span className="muted small-text">{page==="saved"?filteredAlphas.length:history.length || 4} items</span></div>
           {page==="saved" ? <div className="table-scroll"><table className="data-table"><thead><tr><th>Alpha</th><th>Status</th><th>Universe</th><th>Latest Sharpe</th><th>Updated</th><th/></tr></thead><tbody>{filteredAlphas.map(a=><tr key={a.id} className="clickable-row" onClick={()=>applyAlpha(a)}><td><strong>{a.name}</strong><small className="table-expression mono">{a.expression}</small></td><td><Status status={a.status}/></td><td>{a.universe}</td><td className="mono">{fmtNum(a.sharpe)}</td><td className="muted">{a.updated}</td><td><button className="btn btn-quiet" onClick={e=>{e.stopPropagation();applyAlpha(a);}}>Open <ChevronRight size={13}/></button></td></tr>)}</tbody></table></div>
-          : <div className="table-scroll"><table className="data-table"><thead><tr><th>Run ID</th><th>Expression</th><th>Status</th><th>Created</th><th/></tr></thead><tbody>{(history.length?history:[{experiment_id:"demo-8fa2c1",status:"success",expression:demoExamples[0].expression,created_at:new Date().toISOString()},{experiment_id:"demo-7c20e4",status:"success",expression:demoExamples[2].expression,created_at:new Date(Date.now()-86400000).toISOString()}]).filter(r=>`${r.experiment_id} ${r.expression}`.toLowerCase().includes(search.toLowerCase())).map((r,i)=><tr key={r.experiment_id||i}><td className="mono">{r.experiment_id || r.run_id}</td><td><code className="table-expression">{r.expression || "Expression snapshot unavailable"}</code></td><td><Status status={r.status==="success"?"Succeeded":r.status}/></td><td className="muted">{r.created_at?new Date(r.created_at).toLocaleString():"—"}</td><td><button className="btn btn-quiet" onClick={()=>nav("results")}>Inspect <ChevronRight size={13}/></button></td></tr>)}</tbody></table></div>}
-          <div className="table-foot"><span className="demo-inline">Preview mode stores drafts in memory for this browser session. Production persistence requires the Node API and Postgres layer.</span></div>
+          : <div className="table-scroll"><table className="data-table"><thead><tr><th>Run ID</th><th>Expression</th><th>Status</th><th>Created</th><th/></tr></thead><tbody>{(historyLoaded?history:(history.length?history:[{experiment_id:"demo-8fa2c1",status:"success",expression:demoExamples[0].expression,created_at:new Date().toISOString()},{experiment_id:"demo-7c20e4",status:"success",expression:demoExamples[2].expression,created_at:new Date(Date.now()-86400000).toISOString()}])).filter(r=>(String(r.experiment_id || "")+" "+String(r.run_id || "")+" "+String(r.expression || "")).toLowerCase().includes(search.toLowerCase())).map((r,i)=><tr key={r.experiment_id||r.run_id||i}><td className="mono">{r.experiment_id || r.run_id}</td><td><code className="table-expression" title={r.error?.message || ""}>{r.expression || "Expression snapshot unavailable"}</code></td><td><Status status={r.status==="success"?"Succeeded":r.status}/></td><td className="muted">{r.created_at?new Date(r.created_at).toLocaleString():"—"}</td><td><div className="table-row-actions"><button className="btn btn-quiet" onClick={()=>inspectRun(r)}>Inspect <ChevronRight size={13}/></button>{r.status==="queued" && <button className="btn btn-quiet" onClick={()=>cancelRun(r)} aria-label="Cancel queued backtest" title="Cancel queued backtest"><X size={13}/> Cancel</button>}{r.status==="failed" && r.config && <button className="btn btn-quiet" onClick={()=>retryRun(r)} aria-label="Retry failed backtest" title="Retry with saved configuration"><RefreshCw size={13}/> Retry</button>}</div></td></tr>)}{historyLoaded && history.length===0 && <tr><td colSpan={5} className="muted">No execution jobs yet. Run a backtest to populate this history.</td></tr>}</tbody></table></div>}
+          <div className="table-foot"><span className="demo-inline">Run records are read from the backend job store. Multi-user deployments still need per-user authorization and shared storage.</span></div>
         </Panel>
         <Panel title="Compare completed runs" subtitle="Select two or more alphas to compare their latest preview metrics" action={<button className="btn btn-secondary" onClick={()=>notify("Comparison view is a preview; run snapshots should be compared via the production API.")}><GitCompare size={14}/> Compare selected ({selectedRuns.length})</button>}>
           <div className="compare-grid">{alphas.slice(0,4).map(a=><label className={`compare-card ${selectedRuns.includes(a.id)?"checked":""}`} key={a.id}><input type="checkbox" checked={selectedRuns.includes(a.id)} onChange={()=>toggleRun(a.id)}/><div><strong>{a.name}</strong><small className="mono">{a.id} · {a.universe}</small></div><span className="compare-sharpe">{fmtNum(a.sharpe)} <small>Sharpe</small></span></label>)}</div>

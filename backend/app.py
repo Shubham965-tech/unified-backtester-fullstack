@@ -1,10 +1,10 @@
 from __future__ import annotations
-import os, time, json, ast
+import os, time, json, ast, sqlite3
 from pathlib import Path
 from typing import Any
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 try:
     from dotenv import load_dotenv
@@ -12,11 +12,35 @@ try:
 except ImportError:
     pass
 import alpha_engine as engine
+from idea_cache import PROMPT_VERSION, make_cache_key, read_cached_response, write_cached_response
+from candidate_validation import VALIDATOR_VERSION, catalog_fingerprint, validate_expression
+from similarity_retrieval import idea_tokens, retrieve_similar, store_idea_response
+from vector_retrieval import retrieve_similar_vectors, store_idea_vector_response
+from idea_similarity_safety import has_directional_conflict
+from retrieval_context import format_retrieval_context
+from candidate_payload import compact_generated_candidate
+from strategy_handoff import build_strategy_handoff
+from local_summarizer import summarize_for_retrieval
+from catalog_retrieval import retrieve_catalog_context
+from candidate_runtime_validation import validate_candidate_runtime
+from research_context import validate_research_context
+from alpha_generation_service import build_generation_prompt, generate_candidates
+from generation_gateway import MAX_PROMPT_CHARS
+from model_response_contract import ModelResponseContractError, parse_idea_candidates
+from rate_limit import check_rate_limit
+from backtest_service import run_backtest
+from execution_job_contract import ExecutionJobStatus, RunConfiguration
+from execution_job_store import ExecutionJobNotFoundError, InvalidJobTransitionError
+from execution_job_store_factory import create_execution_job_store
+from authentication import register_auth_middleware
 
 BASE = Path(__file__).resolve().parent
 STORE = BASE / "storage"
 STORE.mkdir(parents=True, exist_ok=True)
 TRACKER_FILE = STORE / "experiment_log.json"
+JOB_DATABASE = os.getenv("EXECUTION_JOB_DB", str(STORE / "execution_jobs.sqlite3"))
+JOB_DATABASE_URL = os.getenv("EXECUTION_JOB_DATABASE_URL", "").strip()
+JOB_STORE = create_execution_job_store(JOB_DATABASE_URL, JOB_DATABASE)
 try:
     if TRACKER_FILE.exists():
         engine.TRACKER.load(str(TRACKER_FILE), replace=True)
@@ -26,6 +50,7 @@ except Exception as exc:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
 CORS(app, resources={r"/api/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(",")}})
+register_auth_middleware(app)
 
 def num(v):
     try:
@@ -33,6 +58,37 @@ def num(v):
         return x if np.isfinite(x) else None
     except (TypeError, ValueError):
         return None
+
+
+def valid_cached_ideas(ideas, fields, operators):
+    """Fail closed when cached candidate expressions no longer validate."""
+    if not isinstance(ideas, list) or not ideas:
+        return []
+    accepted = []
+    for item in ideas:
+        if not isinstance(item, dict):
+            return []
+        expression = str(item.get("expression", "")).strip()
+        try:
+            valid, _reason = validate_expression(expression, fields, operators)
+        except Exception:
+            return []
+        if not valid:
+            return []
+        candidate = dict(item)
+        candidate["expression"] = expression
+        accepted.append(candidate)
+    return accepted
+
+
+def attach_strategy_handoffs(candidates, research_context, fields, operators):
+    """Attach a fresh, context-specific handoff to candidates from any cache path."""
+    for candidate in candidates:
+        candidate["handoff"] = build_strategy_handoff(
+            candidate, research_context, set(fields), set(operators)
+        )
+    return candidates
+
 
 def pairs(raw):
     if not isinstance(raw, dict): return []
@@ -135,6 +191,29 @@ def adapt_result(envelope, elapsed):
 @app.post("/api/generate-alpha")
 def generate_alpha_ideas():
     """Turn a plain-language strategy brief into validated candidate expressions."""
+    # Protect the expensive generation path before parsing prompts or touching the
+    # model provider. Use the direct peer address; do not trust X-Forwarded-For
+    # unless a deployment explicitly configures a trusted-proxy middleware.
+    try:
+        allowed, retry_after = check_rate_limit(
+            request.remote_addr or "unknown",
+            database_path=STORE / "api_rate_limits.sqlite3",
+        )
+    except Exception:
+        app.logger.exception("Alpha generation rate limiter unavailable")
+        return jsonify({"error": {"type": "RateLimiterUnavailable", "message": "Generation is temporarily unavailable; retry shortly."}}), 503
+    if not allowed:
+        response = jsonify({
+            "error": {
+                "type": "RateLimitExceeded",
+                "message": "Too many alpha-generation requests. Wait before retrying.",
+                "retry_after_seconds": retry_after,
+            }
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": {"type": "ValidationError", "message": "Request body must be a JSON object."}}), 400
@@ -143,65 +222,299 @@ def generate_alpha_ideas():
         return jsonify({"error": {"type": "ValidationError", "message": "Describe the strategy in at least 20 characters, including the behavior you want to capture."}}), 400
     if len(idea) > 5000:
         return jsonify({"error": {"type": "ValidationError", "message": "Strategy prompt must be 5,000 characters or fewer."}}), 400
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return jsonify({"error": {"type": "ConfigurationError", "message": "Gemini is not configured. Add GEMINI_API_KEY to backend/.env and restart the backend."}}), 503
+
+    # Optional structured fields from the research-idea notebook. Bound them before
+    # using them in model prompts, cache keys, or retrieval features.
+    rationale_for_data_used = payload.get("rationale_for_data_used", "")
+    rationale_for_operators_used = payload.get("rationale_for_operators_used", "")
+    strategy_context = payload.get("strategy_context", {})
+    for field_name, value in (
+        ("rationale_for_data_used", rationale_for_data_used),
+        ("rationale_for_operators_used", rationale_for_operators_used),
+    ):
+        if not isinstance(value, str):
+            return jsonify({"error": {"type": "ValidationError", "message": f"{field_name} must be a string."}}), 400
+        if len(value) > 2000:
+            return jsonify({"error": {"type": "ValidationError", "message": f"{field_name} must be 2,000 characters or fewer."}}), 400
+    if not isinstance(strategy_context, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "strategy_context must be a JSON object."}}), 400
+    try:
+        strategy_context_json = json.dumps(strategy_context, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return jsonify({"error": {"type": "ValidationError", "message": "strategy_context must contain JSON-compatible values."}}), 400
+    if len(strategy_context_json) > 2000:
+        return jsonify({"error": {"type": "ValidationError", "message": "strategy_context must be 2,000 characters or fewer."}}), 400
+
+    capability_interface = engine.describe_interface()
+    normalized_context, context_errors, unsupported_context = validate_research_context(
+        payload, strategy_context, capability_interface
+    )
+    if context_errors:
+        return jsonify({"error": {"type": "ValidationError", "message": "Invalid research context.", "details": context_errors}}), 400
+    if unsupported_context:
+        return jsonify({
+            "status": "unsupported",
+            "assistant_status": "unsupported",
+            "alpha_expression": None,
+            "backtest_executed": False,
+            "warnings": ["D0 intraday is not supported by the current daily-bar engine."],
+            "error": {"type": "UnsupportedStrategyContext", "message": "The production engine does not support this strategy context."},
+        }), 422
+    strategy_context = normalized_context["strategy_context"]
+    strategy_context_json = json.dumps(normalized_context, sort_keys=True, ensure_ascii=False)
+
+    research_context = {
+        "rationale_for_data_used": rationale_for_data_used.strip(),
+        "rationale_for_operators_used": rationale_for_operators_used.strip(),
+        **normalized_context,
+    }
+    research_brief = idea + "\nResearch context: " + strategy_context_json
+    if research_context["rationale_for_data_used"]:
+        research_brief += "\nRationale for data used: " + research_context["rationale_for_data_used"]
+    if research_context["rationale_for_operators_used"]:
+        research_brief += "\nRationale for operators used: " + research_context["rationale_for_operators_used"]
+    if strategy_context:
+        research_brief += "\nStrategy context: " + strategy_context_json
     fields_info = engine.describe_interface().get("fields", {})
     fields = set()
     for value in fields_info.values():
         if isinstance(value, list): fields.update(str(x) for x in value)
         elif isinstance(value, dict): fields.update(str(x) for x in value.keys())
     operators = set(engine.OPERATORS) | set(engine.GROUP_OPERATORS)
-    schema = {"ideas": [{"name": "short readable name", "hypothesis": "testable market hypothesis", "expression": "engine expression", "rationale": "why the signal could work", "expected_behavior": "what a high/low score means", "risks": ["research caveat"]}]}
-    prompt = (
-        "You are a quantitative research assistant for a daily-bar alpha backtester. "
-        "Convert the user's strategy into 3 materially different, testable alpha candidates. "
-        "Return ONLY valid JSON matching this shape: " + json.dumps(schema) +
-        "\nUser strategy: " + idea +
-        "\nSupported fields (only these): " + json.dumps(sorted(fields)) +
-        "\nSupported operators (only these): " + json.dumps(sorted(operators)) +
-        "\nRules: use only listed fields/operators; do not invent data, fundamentals, sentiment, intraday data, or undocumented functions. "
-        "Expressions must be simple expression-language strings, not Python code. Prefer cross-sectional ranking where appropriate. "
-        "Use positive integer lookback windows. Do not promise profitability. If the idea needs unavailable data or intraday timing, "
-        "state that limitation in risks and propose the closest honest daily OHLCV-only proxy. Generate distinct hypotheses, not merely different window lengths."
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    cache_key = make_cache_key(research_brief, sorted(fields), sorted(operators), model)
+    cache_path = STORE / "idea_generation_cache.json"
+    cached = read_cached_response(cache_path, cache_key)
+    if cached is not None:
+        cached_ideas = valid_cached_ideas(cached.get("ideas"), fields, operators)
+        if cached_ideas:
+            runtime_ok = True
+            for candidate in cached_ideas:
+                passed, _reason = validate_candidate_runtime(engine, candidate["expression"], fields)
+                if not passed:
+                    runtime_ok = False
+                    break
+                candidate["runtime_validation"] = "synthetic-data-probe-pass"
+            if runtime_ok:
+                attach_strategy_handoffs(cached_ideas, research_context, fields, operators)
+                cached["ideas"] = cached_ideas
+                cached["provenance"] = {
+                    "validator": VALIDATOR_VERSION,
+                    "catalog_fingerprint": catalog_fingerprint(fields, operators),
+                    "scope": "static-syntax-registry-and-synthetic-runtime-probe",
+                }
+                cached["cache"] = {"hit": True, "strategy": "exact-match"}
+                return jsonify(cached)
+            app.logger.warning("Ignoring exact-match alpha cache entry that failed runtime preflight")
+        app.logger.warning("Ignoring invalid exact-match alpha cache entry")
+
+    catalog_id = f"{catalog_fingerprint(fields, operators)}:{PROMPT_VERSION}"
+    retrieval_summary = summarize_for_retrieval(research_brief)
+    retrieval_brief = retrieval_summary["summary"]
+    vector_path = STORE / "idea_vectors.sqlite3"
+    catalog_context = retrieve_catalog_context(
+        retrieval_brief, capability_interface, fields, operators,
+        limit_per_kind=8, vector_db_path=str(vector_path),
     )
-    try:
-        from google import genai
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), contents=prompt,
-            config={"response_mime_type": "application/json", "temperature": 0.35})
-        raw = json.loads(response.text or "{}")
-        ideas = raw.get("ideas", []) if isinstance(raw, dict) else []
-        accepted, rejected = [], []
-        for item in ideas[:5]:
-            if not isinstance(item, dict): continue
-            expr = str(item.get("expression", "")).strip()
+    retrieval_path = STORE / "idea_retrieval_index.json"
+    lexical_matches = retrieve_similar(
+        retrieval_path, retrieval_brief, model, catalog_id, limit=3, min_similarity=0.25
+    )
+    vector_matches = retrieve_similar_vectors(
+        vector_path, retrieval_brief, model, catalog_id,
+        limit=3, min_similarity=0.25, safety_text=research_brief,
+    )
+    # Merge duplicate candidate sets returned by both retrieval strategies.
+    merged_matches = {}
+    for row in lexical_matches + vector_matches:
+        expression_key = tuple(
+            str(item.get("expression", "")) for item in row.get("ideas", []) if isinstance(item, dict)
+        )
+        if not expression_key:
+            continue
+        previous = merged_matches.get(expression_key)
+        if previous is None or row.get("similarity", 0) > previous.get("similarity", 0):
+            merged_matches[expression_key] = row
+    similar_ideas = sorted(
+        merged_matches.values(), key=lambda row: row.get("similarity", 0), reverse=True
+    )[:3]
+
+    # Reuse a prior validated candidate set only for a very close lexical/vector match.
+    # Require enough query terms to reduce false positives from short generic ideas.
+    query_tokens = idea_tokens(idea)
+    safety_query_tokens = idea_tokens(research_brief)
+    near_duplicate = next(
+        (
+            row for row in similar_ideas
+            if len(query_tokens) >= 5 and row.get("similarity", 0) >= 0.92
+            and not has_directional_conflict(safety_query_tokens, row.get("matched_tokens", []))
+            and isinstance(row.get("ideas"), list) and row["ideas"]
+        ),
+        None,
+    )
+    if near_duplicate is not None:
+        reusable_ideas = valid_cached_ideas(near_duplicate["ideas"], fields, operators)
+        if reusable_ideas:
+            runtime_checked = []
+            for candidate in reusable_ideas:
+                passed, _reason = validate_candidate_runtime(engine, candidate["expression"], fields)
+                if not passed:
+                    runtime_checked = []
+                    break
+                candidate["runtime_validation"] = "synthetic-data-probe-pass"
+                runtime_checked.append(candidate)
+            reusable_ideas = runtime_checked
+        if reusable_ideas:
+            attach_strategy_handoffs(reusable_ideas, research_context, fields, operators)
+            result = {
+                "ideas": reusable_ideas,
+                "rejected": [],
+                "model": model,
+                "provenance": {
+                    "validator": VALIDATOR_VERSION,
+                    "catalog_fingerprint": catalog_id,
+                    "scope": "static-syntax-registry-and-synthetic-runtime-probe",
+                },
+                "note": (
+                    "Reused candidates from a highly similar prior prompt to avoid a model call. "
+                    "Directional-conflict checks are heuristic and lexical similarity is not semantic; "
+                    "verify the expressions and run backtests "
+                    "before interpreting their research value."
+                ),
+                "retrieval": {
+                    "strategy": "local-hybrid-lexical-and-vector",
+                    "matches_used": 1,
+                    "vector_matches_used": len(vector_matches),
+                    "similarity": near_duplicate["similarity"],
+                    "raw_prompt_persisted": False,
+                    "brief_mode": retrieval_summary["mode"],
+                    "catalog_fields_used": [item["name"] for item in catalog_context["fields"]],
+                    "catalog_operators_used": [item["name"] for item in catalog_context["operators"]],
+                },
+                "cache": {"hit": True, "strategy": "similarity"},
+            }
             try:
-                tree = ast.parse(expr, mode="eval")
-                allowed_names = fields | operators | {"True", "False", "None"}
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Name) and node.id not in allowed_names:
-                        raise ValueError("Unsupported identifier: " + node.id)
-                    if isinstance(node, ast.Call) and not isinstance(node.func, ast.Name):
-                        raise ValueError("Only registered function calls are allowed")
-                    if isinstance(node, (ast.Attribute, ast.Subscript, ast.Lambda, ast.DictComp, ast.ListComp, ast.GeneratorExp, ast.NamedExpr)):
-                        raise ValueError("Unsupported expression syntax")
-                unknown_calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)} - operators
-                if unknown_calls: raise ValueError("Unsupported operator(s): " + ", ".join(sorted(unknown_calls)))
-                unknown_fields = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - operators - fields - {"True", "False", "None"}
-                if unknown_fields: raise ValueError("Unsupported field(s): " + ", ".join(sorted(unknown_fields)))
-                item["expression"] = expr
-                item["id"] = "idea-" + str(len(accepted) + 1)
-                item["validation"] = "syntax-and-registry-pass"
-                accepted.append(item)
+                write_cached_response(cache_path, cache_key, result)
+            except OSError:
+                app.logger.warning("Could not persist similarity cache hit", exc_info=True)
+            return jsonify(result)
+        app.logger.warning("Ignoring invalid similar-alpha candidates")
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": {"type": "ConfigurationError", "message": "Gemini is not configured. Add GEMINI_API_KEY to backend/.env and restart the backend."}}), 503
+
+    prompt = build_generation_prompt(idea, fields, operators, similar_ideas, research_context=research_context, catalog_context=catalog_context)
+    if len(prompt) > MAX_PROMPT_CHARS:
+        return jsonify({"error": {"type": "PromptTooLarge", "message": "The assembled research prompt exceeds the configured size limit. Shorten the idea or structured context."}}), 413
+
+    # Count only provider-bound cache misses, not exact/similarity cache hits.
+    # This shared SQLite budget is a cost guard across workers using the same DB.
+    try:
+        daily_limit_raw = os.getenv("ALPHA_MODEL_DAILY_CALL_LIMIT", "100")
+        try:
+            daily_limit = int(daily_limit_raw)
+        except (TypeError, ValueError):
+            daily_limit = 100
+        if not 1 <= daily_limit <= 100_000:
+            daily_limit = 100
+        budget_allowed, budget_retry_after = check_rate_limit(
+            "global-model-provider-budget",
+            database_path=STORE / "api_rate_limits.sqlite3",
+            limit=daily_limit,
+            window_seconds=86400,
+        )
+    except Exception:
+        app.logger.exception("Global model-call budget unavailable")
+        return jsonify({"error": {"type": "ModelBudgetUnavailable", "message": "Generation is temporarily unavailable; retry shortly."}}), 503
+    if not budget_allowed:
+        response = jsonify({
+            "error": {
+                "type": "ModelDailyBudgetExceeded",
+                "message": "The daily model-call budget is exhausted. Try again after the budget window resets.",
+                "retry_after_seconds": budget_retry_after,
+            }
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = str(budget_retry_after)
+        return response
+
+    try:
+        response_text = generate_candidates(api_key, model, prompt)
+        ideas = parse_idea_candidates(response_text)
+        accepted, rejected = [], []
+        seen_expressions: set[str] = set()
+        for item in ideas[:5]:
+            candidate, compact_error = compact_generated_candidate(item)
+            if candidate is None:
+                rejected.append({
+                    "expression": str(item.get("expression", ""))[:1000] if isinstance(item, dict) else "",
+                    "reason": compact_error or "Invalid candidate payload",
+                })
+                continue
+            expr = candidate["expression"]
+            expression_key = " ".join(expr.split())
+            try:
+                if expression_key in seen_expressions:
+                    raise ValueError("Duplicate expression; candidates must be distinct.")
+                valid, reason = validate_expression(expr, fields, operators)
+                if not valid:
+                    raise ValueError(reason or "Expression validation failed")
+                runtime_ok, runtime_reason = validate_candidate_runtime(engine, expr, fields)
+                if not runtime_ok:
+                    raise ValueError("Synthetic runtime probe failed: " + (runtime_reason or "unknown error"))
+                candidate["id"] = "idea-" + str(len(accepted) + 1)
+                candidate["validation"] = "syntax-and-registry-pass"
+                candidate["runtime_validation"] = "synthetic-data-probe-pass"
+                candidate["provenance"] = {
+                    "validator": VALIDATOR_VERSION,
+                    "catalog_fingerprint": catalog_fingerprint(fields, operators),
+                    "scope": "static-syntax-registry-and-synthetic-runtime-probe",
+                }
+                candidate["handoff"] = build_strategy_handoff(
+                    candidate, research_context, set(fields), set(operators)
+                )
+                accepted.append(candidate)
+                seen_expressions.add(expression_key)
             except Exception as exc:
-                rejected.append({"expression": expr, "reason": str(exc)})
+                rejected.append({"expression": expr, "reason": str(exc)[:250]})
         if not accepted:
             return jsonify({"error": {"type": "GenerationValidationError", "message": "Gemini returned no candidates that passed engine field/operator checks. Try a more specific OHLCV-based prompt.", "rejected": rejected}}), 422
-        return jsonify({"ideas": accepted, "rejected": rejected, "model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), "note": "Candidates passed syntax and registry checks only. Run each candidate to verify runtime compatibility and evaluate out-of-sample robustness."})
+        result = {"ideas": accepted, "rejected": rejected, "model": model,
+                  "provenance": {"validator": VALIDATOR_VERSION,
+                                 "catalog_fingerprint": catalog_fingerprint(fields, operators),
+                                 "scope": "static-syntax-registry-and-synthetic-runtime-probe"},
+                  "note": "Candidates passed syntax, registry, and a deterministic synthetic-data runtime probe. Real-data compatibility, data coverage, and out-of-sample robustness still require an actual backtest."}
+        result["retrieval"] = {
+            "strategy": "local-hybrid-lexical-and-vector",
+            "matches_used": len(similar_ideas),
+            "vector_matches_used": len(vector_matches),
+            "raw_prompt_persisted": False,
+            "brief_mode": retrieval_summary["mode"],
+            "catalog_fields_used": [item["name"] for item in catalog_context["fields"]],
+            "catalog_operators_used": [item["name"] for item in catalog_context["operators"]],
+        }
+        try:
+            write_cached_response(cache_path, cache_key, result)
+        except OSError:
+            app.logger.warning("Could not persist idea-generation cache", exc_info=True)
+        try:
+            store_idea_response(retrieval_path, retrieval_brief, model, catalog_id, result, safety_text=research_brief)
+        except OSError:
+            app.logger.warning("Could not persist idea retrieval index", exc_info=True)
+        try:
+            store_idea_vector_response(
+                vector_path, retrieval_brief, model, catalog_id, result, safety_text=research_brief
+            )
+        except (OSError, ValueError, sqlite3.Error):
+            app.logger.warning("Could not persist local idea vector index", exc_info=True)
+        result["cache"] = {"hit": False, "strategy": "exact-match"}
+        return jsonify(result)
     except ImportError:
         return jsonify({"error": {"type": "DependencyError", "message": "Install backend dependencies with: pip install -r requirements.txt (includes google-genai)."}}), 503
+    except ModelResponseContractError as exc:
+        app.logger.warning("Gemini response violated the candidate JSON contract: %s", exc)
+        return jsonify({"error": {"type": "ModelResponseContractError", "message": "The model returned an invalid candidate response. Retry with a clearer research idea.", "details": str(exc)[:200]}}), 502
     except Exception:
         app.logger.exception("Gemini alpha generation failed")
         return jsonify({"error": {"type": "GeminiError", "message": "Gemini generation failed. Check the API key, model availability, quota, and backend logs."}}), 502
@@ -247,7 +560,7 @@ def backtest():
     if not isinstance(payload,dict):
         return jsonify({"error":{"type":"ValidationError","message":"Request body must be a JSON object"}}),400
     started = time.perf_counter()
-    envelope = engine.run_backtest_api(payload)
+    envelope = run_backtest(payload)
     elapsed = time.perf_counter()-started
     try: engine.TRACKER.save(str(TRACKER_FILE))
     except Exception as exc: app.logger.warning("Tracker persistence failed: %s",exc)
@@ -256,6 +569,233 @@ def backtest():
         return jsonify({"experiment_id":envelope.get("experiment_id"),"status":"error",
                         "error":err,"config":envelope.get("config")}), (400 if err.get("type")=="ValidationError" else 422)
     return jsonify(adapt_result(envelope,elapsed))
+
+def execute_execution_job(job_id: str) -> dict[str, Any]:
+    """Execute one queued job and persist a terminal result.
+
+    Safe for worker retries: only a queued job can transition to running, so
+    multiple workers cannot execute the same record concurrently.
+    """
+    job = JOB_STORE.get_job(job_id)
+    JOB_STORE.transition(job_id, ExecutionJobStatus.RUNNING)
+    started = time.perf_counter()
+    try:
+        envelope = run_backtest(job["config"])
+        elapsed = time.perf_counter() - started
+        try:
+            engine.TRACKER.save(str(TRACKER_FILE))
+        except Exception as exc:
+            app.logger.warning("Tracker persistence failed: %s", exc)
+
+        if not isinstance(envelope, dict) or envelope.get("status") != "success":
+            error = (envelope.get("error") if isinstance(envelope, dict) else None) or {
+                "type": "ExecutionError", "message": "Backtest execution failed."
+            }
+            return JOB_STORE.transition(job_id, ExecutionJobStatus.FAILED, error=error)
+
+        result = adapt_result(envelope, elapsed)
+        return JOB_STORE.transition(job_id, ExecutionJobStatus.SUCCEEDED, result=result)
+    except Exception:
+        app.logger.exception("Execution job failed")
+        try:
+            return JOB_STORE.transition(
+                job_id, ExecutionJobStatus.FAILED,
+                error={"type": "InternalError", "message": "Unexpected backtest execution failure."},
+            )
+        except Exception:
+            app.logger.exception("Could not persist failed execution-job status")
+            raise
+
+
+def _validated_execution_job_configuration(payload: dict[str, Any]) -> RunConfiguration:
+    """Validate a normal backtest request against the current engine contract."""
+    validated_payload = engine.validate_backtest_request(payload)
+    fields_info = engine.describe_interface().get("fields", {})
+    fields = set()
+    for value in fields_info.values():
+        if isinstance(value, list):
+            fields.update(str(item) for item in value)
+        elif isinstance(value, dict):
+            fields.update(str(item) for item in value.keys())
+    operators = set(engine.OPERATORS) | set(engine.GROUP_OPERATORS)
+    expression_valid, expression_error = validate_expression(
+        validated_payload["expression"], fields, operators
+    )
+    if not expression_valid:
+        raise ValueError(expression_error or "Expression validation failed.")
+    return RunConfiguration.from_payload(validated_payload)
+
+
+@app.post("/api/execution-jobs")
+def create_execution_job():
+    """Persist a run request and return immediately for background processing."""
+    if not request.is_json:
+        return jsonify({"error": {"type": "ValidationError", "message": "Content-Type must be application/json"}}), 415
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "Request body must be a JSON object"}}), 400
+
+    try:
+        configuration = _validated_execution_job_configuration(payload)
+    except (TypeError, ValueError) as exc:
+        return jsonify({
+            "error": {
+                "type": "ValidationError",
+                "message": str(exc)[:500] or "Run configuration is invalid.",
+            }
+        }), 400
+
+    job = JOB_STORE.create_job(configuration, owner_id=getattr(g, "user_id", None))
+    return jsonify(job), 202
+
+
+@app.post("/api/execution-jobs/from-handoff")
+def create_execution_job_from_handoff():
+    """Revalidate a strategy handoff and queue its expression for a real backtest."""
+    if not request.is_json:
+        return jsonify({"error": {"type": "ValidationError", "message": "Content-Type must be application/json"}}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "Request body must be a JSON object"}}), 400
+    handoff = body.get("handoff")
+    if not isinstance(handoff, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "handoff must be a strategy handoff object."}}), 400
+    if handoff.get("schema_version") != "1.0":
+        return jsonify({"error": {"type": "ValidationError", "message": "Unsupported handoff schema version."}}), 400
+    if handoff.get("assistant_status") != "ready_for_notebook2":
+        return jsonify({
+            "error": {"type": "ClarificationRequired", "message": "Only ready_for_notebook2 handoffs can be queued."},
+            "clarifying_questions": handoff.get("clarifying_questions", []),
+            "backtest_executed": False,
+        }), 422
+    if handoff.get("cluster") != "D1":
+        return jsonify({"error": {"type": "UnsupportedStrategyContext", "message": "Only D1 daily-bar strategies are supported."}}), 422
+
+    expression = handoff.get("alpha_expression")
+    universe = handoff.get("universe")
+    context = handoff.get("strategy_context", {})
+    if not isinstance(expression, str) or not expression.strip():
+        return jsonify({"error": {"type": "ValidationError", "message": "handoff.alpha_expression must be a non-empty string."}}), 400
+    if not isinstance(context, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "handoff.strategy_context must be an object."}}), 400
+
+    config = {
+        "expression": expression,
+        "universe": universe,
+        "start": body.get("start"),
+        "end": body.get("end"),
+    }
+    context_mapping = {
+        "holding_period_bars": "holding_period",
+        "execution_lag_bars": "execution_lag_bars",
+        "execution_price": "execution_price",
+        "portfolio": "portfolio",
+        "weighting": "weighting",
+    }
+    for source, target in context_mapping.items():
+        if source in context:
+            config[target] = context[source]
+
+    overrides = body.get("overrides", {})
+    if not isinstance(overrides, dict):
+        return jsonify({"error": {"type": "ValidationError", "message": "overrides must be an object."}}), 400
+    allowed_overrides = {
+        "transaction_cost_bps", "slippage_bps", "n_buckets", "k",
+        "max_position_weight", "long_exposure", "short_exposure", "group_map",
+    }
+    unknown_overrides = sorted(set(overrides) - allowed_overrides)
+    if unknown_overrides:
+        return jsonify({"error": {"type": "ValidationError", "message": "Unsupported override(s): " + ", ".join(unknown_overrides)}}), 400
+    config.update(overrides)
+
+    try:
+        # Static registry validation is repeated here; a handoff is never trusted
+        # as proof that its expression is valid against the current engine.
+        configuration = _validated_execution_job_configuration(config)
+        fields_info = engine.describe_interface().get("fields", {})
+        fields = set()
+        for value in fields_info.values():
+            if isinstance(value, list):
+                fields.update(str(item) for item in value)
+            elif isinstance(value, dict):
+                fields.update(str(item) for item in value.keys())
+        runtime_ok, runtime_reason = validate_candidate_runtime(
+            engine, configuration.to_dict()["expression"], fields
+        )
+        if not runtime_ok:
+            raise ValueError("Synthetic runtime probe failed: " + (runtime_reason or "unknown error"))
+    except (TypeError, ValueError) as exc:
+        return jsonify({
+            "error": {"type": "ValidationError", "message": str(exc)[:500] or "Handoff validation failed."},
+            "backtest_executed": False,
+        }), 400
+
+    job = JOB_STORE.create_job(configuration, owner_id=getattr(g, "user_id", None))
+    return jsonify({
+        **job,
+        "handoff": {
+            "schema_version": handoff["schema_version"],
+            "assistant_status": handoff["assistant_status"],
+            "backtest_executed": False,
+            "independent_validation": "passed",
+        },
+    }), 202
+
+
+@app.get("/api/execution-jobs")
+def list_execution_jobs():
+    """List recent persisted execution jobs; page size is limited to 100."""
+    raw_limit = request.args.get("limit", "20")
+    try:
+        limit = int(raw_limit)
+        jobs = JOB_STORE.list_jobs(limit=limit, owner_id=getattr(g, "user_id", None))
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": {
+                "type": "ValidationError",
+                "message": "limit must be an integer between 1 and 100.",
+            }
+        }), 400
+    # Result time series can be large. Keep list/polling responses lightweight and
+    # fetch the complete immutable result from GET /api/execution-jobs/<job_id>.
+    summaries = []
+    for job in jobs:
+        summary = {key: value for key, value in job.items() if key != "result"}
+        summary["result_available"] = job.get("result") is not None
+        summaries.append(summary)
+    return jsonify({"jobs": summaries, "count": len(summaries), "limit": limit}), 200
+
+
+@app.post("/api/execution-jobs/<job_id>/cancel")
+def cancel_execution_job(job_id):
+    """Cancel a queued job before a worker claims it; running jobs cannot be stopped."""
+    try:
+        JOB_STORE.get_job(job_id, owner_id=getattr(g, "user_id", None))
+        job = JOB_STORE.transition(job_id, ExecutionJobStatus.CANCELLED)
+        return jsonify(job), 200
+    except ExecutionJobNotFoundError:
+        return jsonify({
+            "error": {"type": "NotFound", "message": "Execution job was not found."}
+        }), 404
+    except InvalidJobTransitionError:
+        return jsonify({
+            "error": {
+                "type": "InvalidJobState",
+                "message": "Only queued execution jobs can be cancelled; this job may already be running or finished.",
+            }
+        }), 409
+
+
+@app.get("/api/execution-jobs/<job_id>")
+def get_execution_job(job_id):
+    """Fetch a persisted execution-job record by identifier."""
+    try:
+        return jsonify(JOB_STORE.get_job(job_id, owner_id=getattr(g, "user_id", None))), 200
+    except ExecutionJobNotFoundError:
+        return jsonify({
+            "error": {"type": "NotFound", "message": "Execution job was not found."}
+        }), 404
+
 
 @app.errorhandler(413)
 def too_large(_err):

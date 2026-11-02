@@ -1,14 +1,16 @@
 # Unified Backtester — connected frontend + backend
 
-This package keeps the previously created React frontend design and connects it to a separate Python Flask API wrapping the uploaded `alpha_backtesting_engine_production_hardened` notebook.
+This repository connects the React + Vite frontend to a Python Flask API that wraps the `alpha_backtesting_engine_production_hardened` notebook-derived engine. The notebook remains the source of truth for expression evaluation, portfolio construction, and backtest calculations.
 
 ## Project structure
 
-- `frontend/` — existing React + Vite + Recharts UI and CSS; no Tailwind.
-- `backend/app.py` — HTTP API, validation boundary, result adapter for the frontend, and local experiment-log persistence.
-- `backend/alpha_engine.py` — implementation cells exported from the notebook, including the original expression engine, feature/operator registry, backtest runner, `BacktestResult`, `describe_interface()` and `run_backtest_api()`.
-- `backend/storage/experiment_log.json` — created after the first API run to persist the notebook tracker locally.
-- `backend/data_cache/`, `backend/universes/`, `backend/external_scores/` — paths expected by the notebook engine.
+- `frontend/` — React + Vite + Recharts UI and CSS.
+- `backend/app.py` — HTTP API, request validation, result adaptation, alpha generation, and execution-job routes.
+- `backend/alpha_engine.py` — notebook-derived expression engine, feature/operator registry, backtest runner, and interface metadata.
+- `backend/backtest_service.py` — service boundary around the authoritative backtest execution call.
+- `backend/execution_job_contract.py`, `backend/execution_job_store.py`, `backend/postgres_execution_job_store.py`, and `backend/execution_job_store_factory.py` — execution configuration/status contract and selectable SQLite/PostgreSQL persistence.
+- `backend/storage/` — local runtime state, including the SQLite execution-job database and notebook experiment log.
+- `backend/data_cache/`, `backend/universes/`, `backend/external_scores/` — data/cache paths expected by the engine.
 
 ## Start the backend
 
@@ -24,7 +26,7 @@ python app.py
 
 The API listens at `http://127.0.0.1:3000`.
 
-The engine uses live Yahoo Finance data through `yfinance` by default. Install `pyarrow` (included in requirements) for the notebook's parquet cache. The requested universe's supporting CSVs must exist where the engine contract requires them; for example, `NIFTY100` requires `backend/universes/nifty100.csv`, and `TOP250`/`TOP500` require their candidate-pool CSV. The engine intentionally does not silently substitute a different universe.
+The engine resolves its default `data_cache/`, `universes/`, and `external_scores/` directories relative to `backend/alpha_engine.py`, so API and worker processes use the same locations even when launched from different working directories. The engine uses live Yahoo Finance data through `yfinance` by default. Install `pyarrow` (included in requirements) for the parquet cache. Required universe files must exist where the engine contract expects them; for example, `NIFTY100` requires `backend/universes/nifty100.csv`, and `TOP250`/`TOP500` require their candidate-pool CSVs. The engine does not silently substitute a different universe.
 
 ## Start the frontend
 
@@ -36,21 +38,32 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Vite forwards `/api/*` to the Flask API on port 3000. The existing UI components and CSS are retained; the API adapter converts the notebook result's time-series dictionaries into the chart-friendly format used by the frontend.
+Open `http://localhost:5173`. Vite forwards `/api/*` to the Flask API on port 3000. The API adapter converts the notebook result's time-series dictionaries into the chart-friendly format used by the frontend.
 
 ## API routes
 
 - `GET /api/health` — backend and engine availability.
-- `GET /api/meta` — live engine interface contract (fields, operators, universes, portfolio/weighting options).
+- `GET /api/meta` — engine interface contract: fields, operators, universes, and portfolio/weighting options.
 - `GET /api/examples` — starter alpha expressions.
-- `GET /api/experiments` — notebook experiment tracker history.
-- `POST /api/backtest` — validates the JSON request using the notebook's `run_backtest_api()`, executes the engine, adapts the actual result for the UI and persists the tracker snapshot.
+- `GET /api/experiments` — recent notebook experiment-tracker entries.
+- `POST /api/backtest` — legacy synchronous backtest endpoint; its existing response contract is retained.
+- `POST /api/execution-jobs` — validate and normalize the full backtest configuration before persisting it; valid requests return `202 Accepted` with a queued job record, while invalid requests return `400` without creating a job.
+- `POST /api/execution-jobs/<job_id>/cancel` — cancel a job only while it is queued; returns `409` if it is already running or terminal.
+- `GET /api/execution-jobs?limit=20` — list recent execution records. `limit` must be between 1 and 100.
+- `GET /api/execution-jobs/<job_id>` — retrieve one persisted execution record by ID.
+- `POST /api/generate-alpha` — generate candidate hypotheses and expressions with Gemini when configured.
 
-Example request:
+### Execution-job lifecycle
+
+The execution-job API persists a job ID, status, run configuration/fingerprint, timestamps, and either a result or error. Status values include `queued`, `running`, `succeeded`, and `failed` (the contract also defines `cancelled`). The HTTP endpoint returns immediately with a queued record. Run one or more worker processes using `python worker.py` from `backend/`; workers poll the shared job store, claim queued jobs through atomic state transitions, and persist results for the frontend to poll. Run the API and worker against the same database configuration. For multi-instance use, configure PostgreSQL; local SQLite is intended for development. Workers refresh each running job's `updated_at` heartbeat (default every 10 seconds). The worker periodically marks jobs failed if their heartbeat is older than `EXECUTION_JOB_STALE_MINUTES` (default 30 minutes, minimum 2). This avoids silently rerunning potentially expensive backtests; submit a failed job again to retry. Tune the timeout above expected scheduling pauses and transient database interruptions. If a worker is paused long enough to miss the threshold, a still-running job may be marked failed; use a generous timeout and monitor worker logs.
+
+The frontend's Runs & History page reads saved jobs and can inspect the result stored on a selected successful job. These records use local SQLite by default at `backend/storage/execution_jobs.sqlite3`; override the path with `EXECUTION_JOB_DB`. To opt into shared PostgreSQL storage, set `EXECUTION_JOB_DATABASE_URL` to a PostgreSQL connection URL. When this variable is set, PostgreSQL is selected instead of SQLite; connection/schema errors fail startup rather than silently falling back. The database user needs permission to create the `execution_jobs` table and its index on first startup.
+
+Example legacy backtest request:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/backtest \\
-  -H 'Content-Type: application/json' \\
+curl -X POST http://127.0.0.1:3000/api/backtest \
+  -H 'Content-Type: application/json' \
   -d '{
     "expression": "rank(ts_zscore(momentum_20, 20))",
     "universe": "NIFTY50",
@@ -66,18 +79,18 @@ curl -X POST http://127.0.0.1:3000/api/backtest \\
   }'
 ```
 
-## Important limitations
+## Important limitations before multi-user deployment
 
-- Backtests run synchronously in the Flask request. This is a connected MVP, not a production job system; long-running jobs can tie up a web worker. Add a queue/worker, polling, cancellation, timeouts, quotas and bounded concurrency before multi-user deployment.
-- Experiment tracking uses the notebook's local JSON tracker. It is not a database and does not provide multi-process locking, tenant ownership or concurrent-writer guarantees.
-- Authentication, per-user authorization, managed secrets, request rate limiting, audit retention policy and production deployment configuration are not implemented.
-- The notebook's regression/synthetic tests are not executed at API startup. A successful HTTP connection does not guarantee live data access for every configured universe/date range.
-- Result data is real engine output when the API call succeeds. If the API is offline or the live-data run fails, the unchanged frontend falls back to its labelled illustrative preview.
-- The notebook's own operator metadata explicitly marks some operator semantics as assumed/unverified. The UI does not override those engine semantics.
+- **Background execution:** long backtests run in separate worker processes, not the Flask request. The frontend polls job status. Configure worker process count deliberately; concurrency limits, stopping an already-running backtest, per-user quotas, and request timeouts remain future work. Queued jobs can be cancelled before a worker claims them; abandoned running jobs are marked failed after a configurable heartbeat timeout rather than automatically rerun.
+- **Persistence:** execution jobs can use PostgreSQL when `EXECUTION_JOB_DATABASE_URL` is configured, or local SQLite by default. The notebook experiment tracker still uses a local JSON file, so it is not shared across instances and does not provide tenant ownership or concurrent-writer guarantees. PostgreSQL job storage alone does not make the full application multi-instance safe.
+- **Authentication and isolation:** authentication, per-user authorization, workspace isolation, managed secrets, request rate limiting, and an audit/retention policy are not implemented. Do not expose this API as a multi-user service until access controls and shared persistence are implemented.
+- **Data availability:** regression/synthetic tests are not run automatically at API startup. A healthy HTTP response does not guarantee that live data is available for every universe/date range.
+- **Preview behavior:** successful API runs display actual engine output. When the API is unavailable or a run fails, the frontend can show its labelled illustrative preview.
+- **Research interpretation:** some operator semantics in the notebook metadata are marked assumed/unverified. Generated or backtested expressions are research hypotheses, not performance guarantees. Inspect data coverage, survivorship bias, point-in-time limitations, execution timing, costs, and out-of-sample robustness.
 
 ## Prompt-to-alpha with Gemini
 
-The Create Alpha screen now includes **Gemini Alpha Assistant**. A user can describe a strategy in plain English, receive three distinct candidate alpha hypotheses and expressions, inspect each candidate's rationale/expected behavior/risks, and click **Backtest this idea**. Candidate backtests use the same `/api/backtest` path and the same notebook-derived engine as manually written expressions.
+The Create Alpha screen includes **Gemini Alpha Assistant**. A user can describe a strategy in plain English and receive candidate hypotheses/expressions with rationale, expected behavior, and risks. Generated candidates are checked against the engine's exposed field/operator registry and a restricted expression syntax before being shown. The checks do not establish runtime compatibility or profitability; backtest candidates through the same notebook-derived engine.
 
 ### Configure Gemini
 
@@ -90,27 +103,115 @@ The Create Alpha screen now includes **Gemini Alpha Assistant**. A user can desc
    ```
 
 3. Install backend dependencies and restart `python app.py`.
-4. Open Create Alpha, write the strategy in the Gemini prompt box, and select **Generate alpha ideas**.
+4. Open Create Alpha, enter a strategy in the prompt box, and select **Generate alpha ideas**.
 
-The key is read only by the Python backend. Do not put it in a `VITE_*` variable or commit `.env` to source control. The endpoint rejects blank/oversized prompts and checks each returned expression against the engine's field/operator registry and a restricted AST shape. These checks are not a performance guarantee; the actual engine performs its own runtime validation when the candidate is backtested.
+The key is read only by the Python backend. Do not put it in a `VITE_*` variable or commit `.env` to source control. The generation endpoint rejects blank/oversized prompts and validates returned expressions against the engine catalog. Similarity retrieval and response caching can reuse prior candidates to avoid some model calls; reuse is heuristic and still requires research validation.
 
-### API addition
+### API request
 
 `POST /api/generate-alpha`
-
-Request:
 
 ```json
 {"idea":"Find stocks with persistent momentum but penalize unusually high recent volatility."}
 ```
 
-Response includes `ideas[]` with `name`, `hypothesis`, `expression`, `rationale`, `expected_behavior`, and `risks`, plus a note explaining that the ideas need backtesting and robustness checks. Missing Gemini configuration returns a clear `503` response.
+The response includes `ideas[]` and validation/provenance metadata. Missing Gemini configuration returns a `503` response.
 
-### Important research limitations
+The notebook-derived backtesting engine is exported into `backend/alpha_engine.py`. The original production notebooks are not currently committed in this repository; end-to-end parity with the production Idea→Expression notebook cannot be independently verified from this checkout.
 
-- Gemini-generated expressions are research hypotheses, not recommendations or claims of profitability.
-- Only fields and operators exposed by the backend engine are allowed. Intraday, fundamental, sentiment, and other unavailable inputs must not be invented.
-- The candidate backtest buttons run candidates individually, using the currently selected universe, date range, portfolio and cost settings.
-- Inspect data coverage, survivorship bias, point-in-time limitations, execution timing, costs and out-of-sample robustness before drawing conclusions.
+## NIFTY 50 universe setup
 
-The two supplied notebooks are included in the project root as references: `Review_Engine.ipynb` and `idea_to_expression_assistant_reference.ipynb`.
+The engine can use a bundled NIFTY 50 fallback list when `backend/universes/nifty50.csv` is absent. That fallback is explicitly not guaranteed current. For a reproducible run, refresh the current constituent snapshot from the official NSE Indices CSV before backtesting:
+
+```bash
+python backend/refresh_nifty50.py
+```
+
+This writes `backend/universes/nifty50.csv` and `nifty50.metadata.json`. The refresh script validates exactly 50 unique symbols and writes atomically only after validation succeeds. This is a **current-membership snapshot**, not point-in-time historical membership; historical runs can therefore have survivorship/reconstitution bias. The engine still allows its fallback when no CSV exists, so production/reproducible runs should execute this refresh step and verify the resulting metadata.
+
+## NIFTY 100 universe setup
+
+The engine requires an explicit constituents file for NIFTY 100 and deliberately does not silently substitute NIFTY 50. Bootstrap or refresh the current constituent snapshot from the official NSE Indices CSV before running NIFTY 100 backtests:
+
+```bash
+python backend/refresh_nifty100.py
+```
+
+This writes `backend/universes/nifty100.csv` and a source/checksum record in `nifty100.metadata.json`. The file is a **current-membership snapshot**, not a point-in-time historical universe; historical backtests using it carry survivorship/reconstitution bias unless you provide historical constituents separately. The script validates exactly 100 unique symbols and fails without replacing the existing file if the source response is invalid.
+
+## Optional local retrieval models
+
+Idea generation works without extra model downloads. By default, retrieval uses deterministic text normalization and hashed local vectors. For stronger local summarization and semantic embeddings, install the optional dependencies and pre-cache compatible models yourself. The backend never downloads models at request time.
+
+### Local summarizer
+
+```bash
+python -m pip install transformers torch
+hf download google/flan-t5-small --local-dir /models/flan-t5-small
+```
+
+Set `LOCAL_SUMMARIZER_MODEL=/models/flan-t5-small` in the backend environment and restart the backend. The model is used only to form a retrieval query; the full research brief is still passed to the generation prompt and exact-cache key. If the path or dependency is unavailable, the backend falls back to deterministic normalization.
+
+### Local semantic embeddings
+
+```bash
+python -m pip install sentence-transformers
+hf download sentence-transformers/all-MiniLM-L6-v2 --local-dir /models/all-MiniLM-L6-v2
+```
+
+Set `ALPHA_EMBEDDING_MODEL=/models/all-MiniLM-L6-v2` and restart the backend. The same local embedding model powers the SQLite vector store for prior candidate sets and the active data/operator catalog. If no usable local model is configured, the store uses deterministic hashed lexical vectors instead. No external embedding API is called.
+
+These models run locally on CPU by default and consume additional memory/latency. Enable them only where the deployment has enough resources. The API key for Gemini remains a backend-only environment secret and is not used by the local summarizer or embedding store.
+
+
+## Model-call reliability for Idea → Expression
+
+Remote alpha generation now goes through `backend/generation_gateway.py`, which enforces a bounded request timeout, caps provider response size, and retries only likely transient network/rate-limit/server failures once. It does not log prompts, credentials, or response bodies. A retry after a timeout can still incur a provider charge if the provider accepted the original request.
+
+Optional backend environment settings:
+
+- `ALPHA_MODEL_TIMEOUT_MS`: request timeout in milliseconds (default `30000`; accepted range 1–120000).
+- `ALPHA_MODEL_RETRIES`: set to `1` to allow one retry on transient errors; default is `0` so each cache miss makes exactly one billable model call.
+
+This is one production-hardening layer, not a claim that the whole Idea → Expression flow is production complete. The pipeline still requires integration tests against the real expression engine and data adapter, operational rate limiting/authentication for public deployments, and parity review against the production notebook once that notebook is available.
+
+
+## Candidate response contract
+
+The Idea → Expression endpoint now rejects malformed/non-object JSON payloads and provider responses that exceed the candidate-count or response-size bounds. Each candidate must pass the existing allowlisted payload compaction, registered-field/operator validation, and deterministic synthetic-data runtime probe. Exact duplicate expressions within one model response are rejected rather than returned as separate candidates.
+
+A synthetic runtime probe is only a compatibility smoke test. It is not a substitute for a backtest on the requested NIFTY universe, historical prices, and out-of-sample dates.
+
+
+## Idea → Expression request limits
+
+The expensive `POST /api/generate-alpha` route has a persistent SQLite fixed-window rate limit (default: 30 requests per client IP per 60 seconds). Configure `ALPHA_GENERATION_RATE_LIMIT` and `ALPHA_GENERATION_RATE_WINDOW_SECONDS` to change the budget. Requests over the budget return HTTP 429 and a `Retry-After` header. If the limiter storage is unavailable, generation fails closed with HTTP 503 rather than proceeding to a paid provider call.
+
+The limiter hashes client identifiers before storing them and does not trust `X-Forwarded-For` by default. It is intended for a single instance or shared SQLite volume; horizontally scaled deployments should use a shared atomic rate-limit store and explicitly configure trusted proxy handling. This limit is an abuse/cost guard, not authentication or per-user quota enforcement.
+
+
+### Model prompt and output budgets
+
+The Idea → Expression model gateway rejects prompts longer than 80,000 characters and caps generated output at 4,096 tokens by default. Set `ALPHA_MODEL_MAX_OUTPUT_TOKENS` to a value from 128 to 8,192 to tune the output budget; values outside the supported range fall back to the default. The output cap bounds generation length but is not a hard monetary budget: provider pricing, input-token size, retries, and provider-side billing behavior still matter.
+
+
+Exact-match idea-cache keys include a prompt-contract version. When the model instructions, candidate schema, or retrieval scoring materially change, increment `PROMPT_VERSION` in `backend/idea_cache.py`; old exact-match entries then become misses instead of silently bypassing the updated prompt. Historical retrieval entries may still be supplied as examples, but are independently revalidated before reuse.
+
+
+### Global model-call budget
+
+In addition to the per-client request limit, the backend reserves one shared daily budget slot only after exact-match and similarity-cache misses, so cache hits do not consume the paid-model budget. The default is 100 provider-bound generation requests per 24-hour fixed window; configure `ALPHA_MODEL_DAILY_CALL_LIMIT` (accepted range 1–100,000) to change it. Exhaustion returns HTTP 429 with `Retry-After`; storage failures fail closed with HTTP 503. This counts generation requests, not tokens or billing units, and one request may make a bounded retry, so provider billing can differ from the counter.
+
+
+## Live NIFTY 50 smoke test
+
+Run this opt-in smoke test only after starting the Flask API and at least one execution worker. It queues a real NIFTY 50 daily-bar backtest through the authenticated API and checks that the persisted result contains live-provider data, a usable time series, and core metrics. The worker must have working Yahoo Finance access; the test can take several minutes and may fail if the provider is unavailable.
+
+```bash
+# In the backend environment, set SUPABASE_AUTH_REQUIRED=true and SUPABASE_URL.
+# Start the API and worker in separate terminals, then export a valid user access token:
+export SUPABASE_ACCESS_TOKEN="..."
+python backend/scripts/smoke_live_nifty50.py --start 2023-01-01 --end 2025-12-31
+```
+
+The script does not call Gemini and therefore does not consume model tokens. It uses the fixed expression `rank(ts_mean(close, 20))` to isolate the real market-data/backtest path. The smoke test is deliberately excluded from CI because CI is offline and must remain deterministic. A passing run is a data-pipeline smoke test, not evidence of alpha profitability. Inspect the returned warnings: the bundled NIFTY 50 list may not represent point-in-time historical membership, and survivorship bias may remain.
